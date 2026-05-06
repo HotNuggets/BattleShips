@@ -110,7 +110,25 @@ export type PeerMessage =
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
-
+// LOCAL DEV SHIM — remove this block before deploying to Claude
+if (!('storage' in window)) {
+  const store: Record<string, string> = {};
+  const sharedStore: Record<string, string> = {};
+  (window as any).storage = {
+    get: async (key: string, shared = false) => {
+      const val = (shared ? sharedStore : store)[key];
+      return val !== undefined ? { key, value: val } : null;
+    },
+    set: async (key: string, value: string, shared = false) => {
+      (shared ? sharedStore : store)[key] = value;
+      return { key, value };
+    },
+    list: async (prefix = '', shared = false) => {
+      const src = shared ? sharedStore : store;
+      return { keys: Object.keys(src).filter(k => k.startsWith(prefix)) };
+    },
+  };
+}
 export const NATIONS: Record<Nation, { name: string; flag: string; color: string; accent: string }> = {
   usa:    { name: 'U.S. NAVY',    flag: '🇺🇸', color: '#3c5a8a', accent: '#4a90d9' },
   russia: { name: 'RUSSIAN NAVY', flag: '🇷🇺', color: '#8a2222', accent: '#d94a4a' },
