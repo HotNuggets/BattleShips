@@ -16,7 +16,7 @@ import {
   // Constants
   NATIONS, AI_NATIONS, SHIP_CONFIGS, ACHIEVEMENTS,
   // Utils
-  colName, todayKey,
+  colName, todayKey, difficultyFromBoardSize, difficultyLabel,
   // Board helpers
   makeBoard, makeEnemyBoard, getCells, isValidPlacement,
   buildShipList, autoPlaceShips,
@@ -25,8 +25,8 @@ import {
   // AI
   createAI, AIEngine,
   // Storage / auth
-  loadUserStats, saveUserStats,
-  tryLogin, tryRegister,
+  loadUserStats, defaultStats,
+  tryLogin, tryRegister, enterAsGuest,
   loadGlobalLeaders,
   processGameResult,
 } from './battleshipsVM';
@@ -173,11 +173,11 @@ const Grid: React.FC<GridProps> = ({
 const App: React.FC = () => {
 
   // ── Auth
-  const [screen, setScreen]         = useState<Screen>('auth');
-  const [authTab, setAuthTab]        = useState<'login' | 'register'>('login');
-  const [authUser, setAuthUser]      = useState('');
-  const [authPass, setAuthPass]      = useState('');
-  const [authErr, setAuthErr]        = useState('');
+  const [screen, setScreen]          = useState<Screen>('auth');
+  const [authTab, setAuthTab]         = useState<'login' | 'register' | 'guest'>('login');
+  const [authUser, setAuthUser]       = useState('');
+  const [authPass, setAuthPass]       = useState('');
+  const [authErr, setAuthErr]         = useState('');
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
 
   // ── Toast
@@ -196,7 +196,6 @@ const App: React.FC = () => {
 
   // ── Game setup
   const [mode, setMode]               = useState<GameMode | null>(null);
-  const [aiDifficulty, setAiDifficulty] = useState<AIDifficulty>('easy');
   const [nation, setNation]           = useState<Nation>('usa');
   const [boardSize, setBoardSize]     = useState<number>(5);
   const [orientation, setOrientation] = useState<Orientation>('H');
@@ -248,7 +247,6 @@ const App: React.FC = () => {
   const myMissesRef      = useRef(0);
   const enemyHitsRef     = useRef(0);
   const modeRef          = useRef<GameMode | null>(null);
-  const aiDiffRef        = useRef<AIDifficulty>('easy');
   const roleRef          = useRef<Role | null>(null);
   const logRef           = useRef<LogEntry[]>([]);
 
@@ -258,7 +256,6 @@ const App: React.FC = () => {
   useEffect(() => { gameOverRef.current    = gameOver;    }, [gameOver]);
   useEffect(() => { isMyTurnRef.current    = isMyTurn;    }, [isMyTurn]);
   useEffect(() => { modeRef.current        = mode;        }, [mode]);
-  useEffect(() => { aiDiffRef.current      = aiDifficulty;}, [aiDifficulty]);
 
   // Auto-scroll battle log
   useEffect(() => {
@@ -277,20 +274,32 @@ const App: React.FC = () => {
   // AUTH
   // ─────────────────────────────────────────
 
-  const handleAuth = async (isRegister: boolean) => {
+  const handleAuth = async () => {
     setAuthErr('');
-    if (!authUser.trim() || !authPass.trim()) { setAuthErr('Username and password required.'); return; }
-    if (authUser.length < 3)                  { setAuthErr('Username must be at least 3 characters.'); return; }
-    if (isRegister && authPass.length < 4)    { setAuthErr('Password must be at least 4 characters.'); return; }
 
-    const err = isRegister
-      ? await tryRegister(authUser, authPass)
-      : await tryLogin(authUser, authPass);
+    if (authTab === 'guest') {
+      const { error } = enterAsGuest(authUser);
+      if (error) { setAuthErr(error); return; }
+      // Guests get fresh in-memory stats — nothing loaded from or saved to storage
+      setCurrentUser({ username: authUser.trim(), stats: defaultStats(authUser.trim()), isGuest: true });
+      setScreen('lobby');
+      return;
+    }
 
+    if (authTab === 'register') {
+      const err = await tryRegister(authUser, authPass);
+      if (err) { setAuthErr(err); return; }
+      const stats = await loadUserStats(authUser.trim());
+      setCurrentUser({ username: authUser.trim(), stats, isGuest: false });
+      setScreen('lobby');
+      return;
+    }
+
+    // login
+    const err = await tryLogin(authUser, authPass);
     if (err) { setAuthErr(err); return; }
-
-    const stats = await loadUserStats(authUser);
-    setCurrentUser({ username: authUser, stats });
+    const stats = await loadUserStats(authUser.trim());
+    setCurrentUser({ username: authUser.trim(), stats, isGuest: false });
     setScreen('lobby');
   };
 
@@ -460,8 +469,8 @@ const App: React.FC = () => {
     isMyTurnRef.current = myTurn;
     setGameOver(false);
     gameOverRef.current = false;
-    setMyHits(0);   myHitsRef.current = 0;
-    setMyMisses(0); myMissesRef.current = 0;
+    setMyHits(0);    myHitsRef.current = 0;
+    setMyMisses(0);  myMissesRef.current = 0;
     setEnemyHits(0); enemyHitsRef.current = 0;
     setEnemyBoard(makeEnemyBoard(boardSize));
     logRef.current = [];
@@ -469,7 +478,9 @@ const App: React.FC = () => {
     setNewAchievements([]);
 
     if (modeRef.current === 'solo') {
-      const ai = createAI(aiDiffRef.current, boardSize);
+      // Difficulty scales with board size — no manual selection needed
+      const difficulty = difficultyFromBoardSize(boardSize);
+      const ai = createAI(difficulty, boardSize);
       aiRef.current = ai;
       const randNation = AI_NATIONS[Math.floor(Math.random() * AI_NATIONS.length)];
       setOpponentNation(randNation);
@@ -705,14 +716,16 @@ const App: React.FC = () => {
 
     if (currentUser) {
       const { updatedStats, newAchievements: achs } = await processGameResult({
-        username:   currentUser.username,
+        username:     currentUser.username,
+        isGuest:      currentUser.isGuest,
         won,
-        hits:       myHitsRef.current,
-        misses:     myMissesRef.current,
-        difficulty: aiDiffRef.current,
-        mode:       modeRef.current!,
+        hits:         myHitsRef.current,
+        misses:       myMissesRef.current,
+        boardSize,
+        mode:         modeRef.current!,
+        currentStats: currentUser.stats, // used by guests to update in-memory stats
       });
-      setCurrentUser({ username: currentUser.username, stats: updatedStats });
+      setCurrentUser({ ...currentUser, stats: updatedStats });
       setNewAchievements(achs);
     }
     setScreen('result');
@@ -750,9 +763,18 @@ const App: React.FC = () => {
               <div className={styles.hdrUser}>
                 <div className={styles.hdrUserDot} />
                 {currentUser.username}
+                {currentUser.isGuest && (
+                  <span style={{ fontSize: 9, fontFamily: 'var(--font-hud)', color: 'var(--tx3)', letterSpacing: 1, border: '1px solid var(--border)', padding: '1px 5px' }}>
+                    GUEST
+                  </span>
+                )}
               </div>
-              <button className={styles.hdrBtn} onClick={openScoreboard}>📊 SCOREBOARD</button>
-              <button className={styles.hdrBtn} onClick={() => { setCurrentUser(null); setScreen('auth'); }}>LOGOUT</button>
+              {!currentUser.isGuest && (
+                <button className={styles.hdrBtn} onClick={openScoreboard}>📊 SCOREBOARD</button>
+              )}
+              <button className={styles.hdrBtn} onClick={() => { setCurrentUser(null); setAuthUser(''); setAuthPass(''); setAuthErr(''); setScreen('auth'); }}>
+                {currentUser.isGuest ? 'EXIT' : 'LOGOUT'}
+              </button>
             </>
           ) : (
             <span className={styles.hdrBlink}>● OFFLINE</span>
@@ -766,48 +788,72 @@ const App: React.FC = () => {
           <div className={styles.authBox}>
             <div className={styles.authTitle}>NAVAL<br />WARFARE</div>
             <div className={styles.authSub}>▸ Strategic Combat ◂</div>
+
+            {/* Three tabs */}
             <div className={styles.authTabs}>
-              {(['login', 'register'] as const).map(tab => (
+              {(['login', 'register', 'guest'] as const).map(tab => (
                 <div
                   key={tab}
                   className={`${styles.authTab} ${authTab === tab ? styles.active : ''}`}
                   onClick={() => { setAuthTab(tab); setAuthErr(''); }}
                 >
-                  {tab.toUpperCase()}
+                  {tab === 'login' ? 'LOGIN' : tab === 'register' ? 'REGISTER' : 'PLAY AS GUEST'}
                 </div>
               ))}
             </div>
+
             <div className={styles.panel}>
+              {/* Username — always shown */}
               <div className={styles.inputGroup}>
-                <label className={styles.inputLabel}>COMMANDER NAME</label>
+                <label className={styles.inputLabel}>
+                  {authTab === 'guest' ? 'CHOOSE A CALLSIGN' : 'COMMANDER NAME'}
+                </label>
                 <input
                   className={styles.input}
                   type="text"
-                  placeholder="username"
+                  placeholder={authTab === 'guest' ? 'any name, no password needed' : 'username'}
                   value={authUser}
                   onChange={e => setAuthUser(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleAuth(authTab === 'register')}
+                  onKeyDown={e => e.key === 'Enter' && handleAuth()}
+                  autoFocus
                 />
               </div>
-              <div className={styles.inputGroup}>
-                <label className={styles.inputLabel}>ACCESS CODE</label>
-                <input
-                  className={styles.input}
-                  type="password"
-                  placeholder="password"
-                  value={authPass}
-                  onChange={e => setAuthPass(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleAuth(authTab === 'register')}
-                />
-              </div>
+
+              {/* Password — only for login/register */}
+              {authTab !== 'guest' && (
+                <div className={styles.inputGroup}>
+                  <label className={styles.inputLabel}>ACCESS CODE</label>
+                  <input
+                    className={styles.input}
+                    type="password"
+                    placeholder="password"
+                    value={authPass}
+                    onChange={e => setAuthPass(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleAuth()}
+                  />
+                </div>
+              )}
+
+              {/* Guest info blurb */}
+              {authTab === 'guest' && (
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--tx3)', lineHeight: 1.6, marginBottom: 14, padding: '10px 12px', border: '1px solid var(--border)', background: 'var(--s2)' }}>
+                  ℹ Guest sessions are temporary. Your wins will appear on the global leaderboard for today, but stats and achievements are not saved. Refreshing the page ends your session.
+                </div>
+              )}
+
               {authErr && <div className={styles.inputErr}>⚠ {authErr}</div>}
+
               <div style={{ marginTop: 20 }}>
                 <button
-                  className={`${styles.btn} ${styles.btnGold}`}
+                  className={`${styles.btn} ${authTab === 'guest' ? styles.btnGreen : styles.btnGold}`}
                   style={{ width: '100%' }}
-                  onClick={() => handleAuth(authTab === 'register')}
+                  onClick={handleAuth}
                 >
-                  <span>{authTab === 'login' ? '▸ ENTER COMMAND CENTER' : '▸ CREATE ACCOUNT'}</span>
+                  <span>
+                    {authTab === 'login'    ? '▸ ENTER COMMAND CENTER'
+                    : authTab === 'register' ? '▸ CREATE ACCOUNT'
+                    :                         '▸ PLAY AS GUEST'}
+                  </span>
                 </button>
               </div>
             </div>
@@ -825,7 +871,7 @@ const App: React.FC = () => {
               <div className={`${styles.lobbyCard} ${styles.solo}`} onClick={() => setLobbyPanel(lobbyPanel === 'solo' ? null : 'solo')}>
                 <div className={styles.lcIcon}>🤖</div>
                 <div className={styles.lcTitle}>VS COMPUTER</div>
-                <div className={styles.lcDesc}>Battle an AI opponent. Choose Easy, Medium, or Hard difficulty.</div>
+                <div className={styles.lcDesc}>Battle an AI. Difficulty scales with board size — bigger board, smarter enemy.</div>
               </div>
               <div className={styles.lobbyCard} onClick={createRoom}>
                 <div className={styles.lcIcon}>⚓</div>
@@ -837,24 +883,34 @@ const App: React.FC = () => {
                 <div className={styles.lcTitle}>JOIN BATTLE</div>
                 <div className={styles.lcDesc}>Enter your opponent's room code to join their fleet battle.</div>
               </div>
+              {/* Scoreboard card — always shown; label differs for guests */}
+              <div className={`${styles.lobbyCard} ${styles.score}`} onClick={openScoreboard}>
+                <div className={styles.lcIcon}>{currentUser?.isGuest ? '🏅' : '📊'}</div>
+                <div className={styles.lcTitle}>{currentUser?.isGuest ? 'LEADERBOARD' : 'SCOREBOARD'}</div>
+                <div className={styles.lcDesc}>
+                  {currentUser?.isGuest
+                    ? "View today's global rankings. Register to track your own stats & achievements."
+                    : 'View your personal stats, achievements, and the global daily leaderboard.'}
+                </div>
+              </div>
             </div>
 
-            {/* Solo panel */}
+            {/* Solo panel — clicking a card also sets boardSize */}
             {lobbyPanel === 'solo' && (
               <div className={styles.roomPanel}>
-                <div className={styles.roomPanelTitle}>▸ VS COMPUTER — SELECT DIFFICULTY</div>
+                <div className={styles.roomPanelTitle}>▸ VS COMPUTER — DIFFICULTY IS SET BY BOARD SIZE</div>
                 <div className={styles.aiDiffGrid}>
                   {[
-                    { id: 'easy' as AIDifficulty,   label: 'ENSIGN',  badge: 'EASY',   badgeCls: styles.badgeEasy,   selCls: styles.selEasy,   desc: 'Random targeting. No follow-up on hits. Great for beginners.' },
-                    { id: 'medium' as AIDifficulty, label: 'CAPTAIN', badge: 'MEDIUM', badgeCls: styles.badgeMedium, selCls: styles.selMedium, desc: 'Hunt & Target AI. Follows up hits to sink ships methodically.' },
-                    { id: 'hard' as AIDifficulty,   label: 'ADMIRAL', badge: 'HARD',   badgeCls: styles.badgeHard,   selCls: styles.selHard,   desc: 'Probability density mapping. Calculates optimal shots.' },
+                    { size: 5,  rank: 'ENSIGN',  badge: 'EASY',   badgeCls: styles.badgeEasy,   selCls: styles.selEasy,   cls: styles.easy,   desc: '5×5 grid · 3 ships · AI fires randomly. Perfect for beginners.' },
+                    { size: 10, rank: 'CAPTAIN', badge: 'MEDIUM', badgeCls: styles.badgeMedium, selCls: styles.selMedium, cls: styles.medium, desc: '10×10 grid · 6 ships · AI hunts & targets hits methodically.' },
+                    { size: 15, rank: 'ADMIRAL', badge: 'HARD',   badgeCls: styles.badgeHard,   selCls: styles.selHard,   cls: styles.hard,   desc: '15×15 grid · 10 ships · AI uses probability maps. Very hard.' },
                   ].map(d => (
                     <div
-                      key={d.id}
-                      className={`${styles.aiDiffCard} ${aiDifficulty === d.id ? d.selCls : ''}`}
-                      onClick={() => setAiDifficulty(d.id)}
+                      key={d.size}
+                      className={`${styles.aiDiffCard} ${boardSize === d.size ? d.selCls : ''}`}
+                      onClick={() => setBoardSize(d.size)}
                     >
-                      <div className={`${styles.adcName} ${styles[d.id]}`}>{d.label}</div>
+                      <div className={`${styles.adcName} ${d.cls}`}>{d.rank}</div>
                       <div className={`${styles.adcBadge} ${d.badgeCls}`}>{d.badge}</div>
                       <div className={styles.adcDesc}>{d.desc}</div>
                     </div>
@@ -1111,56 +1167,86 @@ const App: React.FC = () => {
       {/* ══ SCOREBOARD SCREEN ══ */}
       {screen === 'scoreboard' && currentUser && (
         <div className={styles.scoreScreen}>
-          <div className={styles.sbTitle}>📊 SCOREBOARD</div>
+          <div className={styles.sbTitle}>{currentUser.isGuest ? '🏅 LEADERBOARD' : '📊 SCOREBOARD'}</div>
           <div className={styles.sbSub}>▸ FLEET RECORDS & GLOBAL RANKINGS ◂</div>
           <div style={{ marginBottom: 16 }}>
             <button className={`${styles.btn} ${styles.btnSm}`} onClick={goLobby}><span>◂ BACK</span></button>
           </div>
           <div className={styles.sbLayout}>
-            {/* Personal stats + achievements */}
+            {/* Left column: personal stats for registered users, or guest CTA */}
             <div>
-              <div className={styles.sbSection}>
-                <div className={styles.sbSectionTitle}>▸ COMMANDER: {currentUser.username.toUpperCase()}</div>
-                <div className={styles.statGrid}>
-                  {[
-                    { val: currentUser.stats.wins,        lbl: 'TOTAL WINS' },
-                    { val: currentUser.stats.losses,      lbl: 'LOSSES' },
-                    { val: currentUser.stats.gamesPlayed, lbl: 'GAMES PLAYED' },
-                    { val: currentUser.stats.bestStreak,  lbl: 'BEST STREAK' },
-                    { val: currentUser.stats.winStreak,   lbl: 'CURRENT STREAK' },
-                    {
-                      val: `${currentUser.stats.totalShots > 0
-                        ? Math.round(currentUser.stats.totalHits / currentUser.stats.totalShots * 100)
-                        : 0}%`,
-                      lbl: 'LIFETIME ACCURACY',
-                    },
-                  ].map((s, i) => (
-                    <div key={i} className={styles.statCard}>
-                      <div className={styles.statVal}>{s.val}</div>
-                      <div className={styles.statLbl}>{s.lbl}</div>
+              {!currentUser.isGuest ? (
+                <>
+                  <div className={styles.sbSection}>
+                    <div className={styles.sbSectionTitle}>▸ COMMANDER: {currentUser.username.toUpperCase()}</div>
+                    <div className={styles.statGrid}>
+                      {[
+                        { val: currentUser.stats.wins,        lbl: 'TOTAL WINS' },
+                        { val: currentUser.stats.losses,      lbl: 'LOSSES' },
+                        { val: currentUser.stats.gamesPlayed, lbl: 'GAMES PLAYED' },
+                        { val: currentUser.stats.bestStreak,  lbl: 'BEST STREAK' },
+                        { val: currentUser.stats.winStreak,   lbl: 'CURRENT STREAK' },
+                        {
+                          val: `${currentUser.stats.totalShots > 0
+                            ? Math.round(currentUser.stats.totalHits / currentUser.stats.totalShots * 100)
+                            : 0}%`,
+                          lbl: 'LIFETIME ACCURACY',
+                        },
+                      ].map((s, i) => (
+                        <div key={i} className={styles.statCard}>
+                          <div className={styles.statVal}>{s.val}</div>
+                          <div className={styles.statLbl}>{s.lbl}</div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </div>
+                  <div className={styles.sbSection}>
+                    <div className={styles.sbSectionTitle}>▸ ACHIEVEMENTS</div>
+                    <div className={styles.achieveGrid}>
+                      {ACHIEVEMENTS.map(ach => {
+                        const unlocked = ach.check(currentUser.stats);
+                        return (
+                          <div key={ach.id} className={`${styles.achCard} ${unlocked ? styles.unlocked : styles.locked}`}>
+                            <div className={styles.achIcon}>{ach.icon}</div>
+                            <div className={styles.achTitle}>{ach.title}</div>
+                            <div className={styles.achDesc}>{ach.desc}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                /* Guest sees a prompt to register */
+                <div className={styles.sbSection}>
+                  <div className={styles.sbSectionTitle}>▸ PLAYING AS GUEST</div>
+                  <div style={{ background: 'var(--s2)', border: '1px solid var(--border)', padding: 20, marginBottom: 16 }}>
+                    <div style={{ fontSize: 32, marginBottom: 12, textAlign: 'center' }}>🔒</div>
+                    <div style={{ fontFamily: 'var(--font-hud)', fontSize: 13, color: 'var(--ac)', marginBottom: 10, textAlign: 'center', letterSpacing: 1 }}>
+                      STATS & ACHIEVEMENTS LOCKED
+                    </div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--tx2)', lineHeight: 1.7, textAlign: 'center', marginBottom: 16 }}>
+                      Guest sessions don't save your progress.<br />
+                      Register a free account to unlock:<br />
+                      persistent win history · achievements · streaks
+                    </div>
+                    <div style={{ textAlign: 'center' }}>
+                      <button
+                        className={`${styles.btn} ${styles.btnGold}`}
+                        onClick={() => { setCurrentUser(null); setAuthUser(''); setAuthPass(''); setAuthErr(''); setAuthTab('register'); setScreen('auth'); }}
+                      >
+                        <span>▸ CREATE FREE ACCOUNT</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--tx3)', lineHeight: 1.6, padding: '10px 12px', border: '1px solid var(--border)' }}>
+                    ℹ Guest wins appear on the leaderboard today tagged with [G]. Your username may be claimed by anyone — register to secure it.
+                  </div>
                 </div>
-              </div>
-
-              <div className={styles.sbSection}>
-                <div className={styles.sbSectionTitle}>▸ ACHIEVEMENTS</div>
-                <div className={styles.achieveGrid}>
-                  {ACHIEVEMENTS.map(ach => {
-                    const unlocked = ach.check(currentUser.stats);
-                    return (
-                      <div key={ach.id} className={`${styles.achCard} ${unlocked ? styles.unlocked : styles.locked}`}>
-                        <div className={styles.achIcon}>{ach.icon}</div>
-                        <div className={styles.achTitle}>{ach.title}</div>
-                        <div className={styles.achDesc}>{ach.desc}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+              )}
             </div>
 
-            {/* Global leaderboard */}
+            {/* Right column: global leaderboard */}
             <div>
               <div className={styles.sbSection}>
                 <div className={styles.sbSectionTitle}>
@@ -1183,8 +1269,12 @@ const App: React.FC = () => {
                         No battles recorded today.
                       </div>
                     ) : globalLeaders.map((entry, i) => {
+                      // Match both "username" and "username [G]" for guests
+                      const myName = currentUser.isGuest
+                        ? `${currentUser.username} [G]`
+                        : currentUser.username;
+                      const isMe = entry.username.toLowerCase() === myName.toLowerCase();
                       const rankCls = i === 0 ? styles.gold : i === 1 ? styles.silver : i === 2 ? styles.bronze : '';
-                      const isMe = entry.username.toLowerCase() === currentUser.username.toLowerCase();
                       return (
                         <div key={entry.username} className={`${styles.lbRow} ${isMe ? styles.me : ''}`}>
                           <span className={`${styles.lbRank} ${rankCls}`}>{i === 0 ? '👑' : i + 1}</span>

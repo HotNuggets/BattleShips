@@ -10,7 +10,7 @@
 
 export type Screen = 'auth' | 'lobby' | 'setup' | 'game' | 'scoreboard' | 'result';
 export type GameMode = 'solo' | 'multi';
-export type AIDifficulty = 'easy' | 'medium' | 'hard';
+export type AIDifficulty = 'easy' | 'medium' | 'hard'; // derived from board size — not chosen by user
 export type Nation = 'usa' | 'russia' | 'china';
 export type Orientation = 'H' | 'V';
 export type Role = 'host' | 'guest';
@@ -53,11 +53,6 @@ export interface PlacedShip {
   size: number;
 }
 
-export interface UserRecord {
-  username: string;
-  passwordHash: string;
-}
-
 export interface UserStats {
   username: string;
   wins: number;
@@ -68,13 +63,19 @@ export interface UserStats {
   winStreak: number;
   bestStreak: number;
   bestAccuracy: number;
-  beatenAdmiral: number;
+  beatenHardAI: number; // won on 15×15 (hardest board = Admiral AI)
   dailyWins: Record<string, number>;
+}
+
+export interface UserRecord {
+  username: string;
+  passwordHash: string;
 }
 
 export interface CurrentUser {
   username: string;
   stats: UserStats;
+  isGuest: boolean; // guests have no persistent storage — stats live in memory only
 }
 
 export interface GlobalLeaderEntry {
@@ -110,25 +111,7 @@ export type PeerMessage =
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
-// LOCAL DEV SHIM — remove this block before deploying to Claude
-if (!('storage' in window)) {
-  const store: Record<string, string> = {};
-  const sharedStore: Record<string, string> = {};
-  (window as any).storage = {
-    get: async (key: string, shared = false) => {
-      const val = (shared ? sharedStore : store)[key];
-      return val !== undefined ? { key, value: val } : null;
-    },
-    set: async (key: string, value: string, shared = false) => {
-      (shared ? sharedStore : store)[key] = value;
-      return { key, value };
-    },
-    list: async (prefix = '', shared = false) => {
-      const src = shared ? sharedStore : store;
-      return { keys: Object.keys(src).filter(k => k.startsWith(prefix)) };
-    },
-  };
-}
+
 export const NATIONS: Record<Nation, { name: string; flag: string; color: string; accent: string }> = {
   usa:    { name: 'U.S. NAVY',    flag: '🇺🇸', color: '#3c5a8a', accent: '#4a90d9' },
   russia: { name: 'RUSSIAN NAVY', flag: '🇷🇺', color: '#8a2222', accent: '#d94a4a' },
@@ -172,7 +155,7 @@ export const ACHIEVEMENTS: Achievement[] = [
   { id: 'streak3',      icon: '🔥', title: 'On Fire',        desc: 'Win 3 battles in a row',               check: s => s.bestStreak >= 3 },
   { id: 'streak5',      icon: '⚡', title: 'Unstoppable',    desc: 'Win 5 battles in a row',               check: s => s.bestStreak >= 5 },
   { id: 'played10',     icon: '🚢', title: 'Sea Dog',        desc: 'Play 10 games',                        check: s => s.gamesPlayed >= 10 },
-  { id: 'admiral',      icon: '👑', title: 'The Admiral',    desc: 'Beat the Admiral AI difficulty',       check: s => (s.beatenAdmiral ?? 0) >= 1 },
+  { id: 'admiral',      icon: '👑', title: 'The Admiral',    desc: 'Beat the Admiral AI on a 15×15 board', check: s => (s.beatenHardAI ?? 0) >= 1 },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -189,6 +172,24 @@ export const simpleHash = (str: string): string => {
     h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   }
   return h.toString(16);
+};
+
+/**
+ * Board size drives AI difficulty automatically.
+ * 5×5   → easy   (random shots — Ensign)
+ * 10×10 → medium (hunt & target — Captain)
+ * 15×15 → hard   (probability density — Admiral)
+ */
+export const difficultyFromBoardSize = (boardSize: number): AIDifficulty => {
+  if (boardSize <= 5)  return 'easy';
+  if (boardSize <= 10) return 'medium';
+  return 'hard';
+};
+
+export const difficultyLabel = (boardSize: number): { rank: string; badge: string } => {
+  if (boardSize <= 5)  return { rank: 'ENSIGN',  badge: 'EASY' };
+  if (boardSize <= 10) return { rank: 'CAPTAIN', badge: 'MEDIUM' };
+  return                      { rank: 'ADMIRAL', badge: 'HARD' };
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -577,7 +578,7 @@ export const defaultStats = (username: string): UserStats => ({
   winStreak: 0,
   bestStreak: 0,
   bestAccuracy: 0,
-  beatenAdmiral: 0,
+  beatenHardAI: 0,
   dailyWins: {},
 });
 
@@ -595,9 +596,43 @@ export const saveUserStats = async (stats: UserStats): Promise<void> => {
   } catch (_e) {}
 };
 
+// ─────────────────────────────────────────────────────────────
+// AUTH HELPERS
+// ─────────────────────────────────────────────────────────────
+
+const validateUsername = (username: string): string | null => {
+  const t = username.trim();
+  if (t.length < 2)  return 'Username must be at least 2 characters.';
+  if (t.length > 20) return 'Username must be 20 characters or less.';
+  if (!/^[a-zA-Z0-9_\- ]+$/.test(t)) return 'Only letters, numbers, spaces, _ and - allowed.';
+  return null;
+};
+
+export const tryRegister = async (username: string, password: string): Promise<string | null> => {
+  const nameErr = validateUsername(username);
+  if (nameErr) return nameErr;
+  if (password.length < 4) return 'Password must be at least 4 characters.';
+
+  const key = `user:${username.trim().toLowerCase()}`;
+  const hash = simpleHash(password);
+  try {
+    try {
+      const existing = await window.storage.get(key);
+      if (existing) return 'Username already taken.';
+    } catch (_e) {}
+    await window.storage.set(key, JSON.stringify({ username: username.trim(), passwordHash: hash } as UserRecord));
+    return null;
+  } catch (_e) {
+    return 'Storage error — try again.';
+  }
+};
+
 export const tryLogin = async (username: string, password: string): Promise<string | null> => {
-  // Returns null on success, error string on failure
-  const key = `user:${username.toLowerCase()}`;
+  const nameErr = validateUsername(username);
+  if (nameErr) return nameErr;
+  if (!password) return 'Password is required.';
+
+  const key = `user:${username.trim().toLowerCase()}`;
   const hash = simpleHash(password);
   try {
     const res = await window.storage.get(key);
@@ -610,19 +645,17 @@ export const tryLogin = async (username: string, password: string): Promise<stri
   }
 };
 
-export const tryRegister = async (username: string, password: string): Promise<string | null> => {
-  const key = `user:${username.toLowerCase()}`;
-  const hash = simpleHash(password);
-  try {
-    try {
-      const existing = await window.storage.get(key);
-      if (existing) return 'Username already taken.';
-    } catch (_e) {}
-    await window.storage.set(key, JSON.stringify({ username, passwordHash: hash } as UserRecord));
-    return null;
-  } catch (_e) {
-    return 'Storage error — try again.';
-  }
+/**
+ * Guest sign-in — username only, no password, no registration.
+ * Stats live in memory for the session only.
+ * Refreshing the page clears the session; the player must re-enter a name.
+ * Guest wins appear on the global leaderboard (tagged [G]) but personal
+ * achievement progress is NOT persisted to storage.
+ */
+export const enterAsGuest = (username: string): { error: string | null } => {
+  const nameErr = validateUsername(username);
+  if (nameErr) return { error: nameErr };
+  return { error: null };
 };
 
 export const saveGlobalLeaderEntry = async (
@@ -664,11 +697,14 @@ export const loadGlobalLeaders = async (): Promise<GlobalLeaderEntry[]> => {
 
 export interface GameResultInput {
   username: string;
+  isGuest: boolean;  // guests: update in-memory stats only, no storage writes
   won: boolean;
   hits: number;
   misses: number;
-  difficulty: AIDifficulty;
+  boardSize: number; // difficulty is derived from board size
   mode: GameMode;
+  // For guests we pass the current in-memory stats so we can update them
+  currentStats?: UserStats;
 }
 
 export interface GameResultOutput {
@@ -677,19 +713,24 @@ export interface GameResultOutput {
 }
 
 export const processGameResult = async (input: GameResultInput): Promise<GameResultOutput> => {
-  const { username, won, hits, misses, difficulty, mode } = input;
-  const stats = await loadUserStats(username);
+  const { username, isGuest, won, hits, misses, boardSize, mode, currentStats } = input;
+  const difficulty = difficultyFromBoardSize(boardSize);
   const shots = hits + misses;
-  const acc = shots > 0 ? Math.round((hits / shots) * 100) : 0;
+  const acc   = shots > 0 ? Math.round((hits / shots) * 100) : 0;
+
+  // Guests start from their in-memory stats; registered users load from storage
+  const stats: UserStats = isGuest
+    ? { ...(currentStats ?? defaultStats(username)) }
+    : await loadUserStats(username);
 
   // Snapshot unlocked achievements before update
   const prevUnlocked = new Set(ACHIEVEMENTS.filter(a => a.check(stats)).map(a => a.id));
 
   // Update stats
   stats.gamesPlayed++;
-  stats.totalShots += shots;
-  stats.totalHits += hits;
-  stats.bestAccuracy = Math.max(stats.bestAccuracy ?? 0, acc);
+  stats.totalShots   += shots;
+  stats.totalHits    += hits;
+  stats.bestAccuracy  = Math.max(stats.bestAccuracy ?? 0, acc);
 
   if (won) {
     stats.wins++;
@@ -698,22 +739,33 @@ export const processGameResult = async (input: GameResultInput): Promise<GameRes
     const today = todayKey();
     stats.dailyWins[today] = (stats.dailyWins[today] ?? 0) + 1;
     if (difficulty === 'hard' && mode === 'solo') {
-      stats.beatenAdmiral = (stats.beatenAdmiral ?? 0) + 1;
+      stats.beatenHardAI = (stats.beatenHardAI ?? 0) + 1;
     }
   } else {
     stats.losses++;
     stats.winStreak = 0;
   }
 
-  await saveUserStats(stats);
-  await saveGlobalLeaderEntry(
-    username,
-    stats.dailyWins[todayKey()] ?? 0,
-    stats.wins
-  );
+  if (!isGuest) {
+    // Registered users: persist stats and contribute to the global leaderboard
+    await saveUserStats(stats);
+    await saveGlobalLeaderEntry(
+      username,
+      stats.dailyWins[todayKey()] ?? 0,
+      stats.wins
+    );
+  } else if (won) {
+    // Guests who win still appear on the leaderboard (tagged with [G])
+    // but we never write to their personal stats key in storage
+    const displayName = `${username} [G]`;
+    const today = todayKey();
+    await saveGlobalLeaderEntry(
+      displayName,
+      stats.dailyWins[today] ?? 0,
+      stats.wins
+    );
+  }
 
-  // Detect newly unlocked achievements
   const newAchievements = ACHIEVEMENTS.filter(a => a.check(stats) && !prevUnlocked.has(a.id));
-
   return { updatedStats: stats, newAchievements };
 };
