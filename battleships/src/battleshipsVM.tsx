@@ -279,9 +279,13 @@ export const createAudioEngine = (): AudioEngine => {
 
   const getCtx = (): AudioContext => {
     if (!ctx) {
-      ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const AudioCtx =
+        (window as any).AudioContext as typeof AudioContext | undefined ??
+        (window as any).webkitAudioContext as typeof AudioContext | undefined;
+      if (!AudioCtx) throw new Error('Web Audio API not supported');
+      ctx = new AudioCtx();
     }
-    return ctx;
+    return ctx!;
   };
 
   const playCannonShot = (): void => {
